@@ -20,7 +20,7 @@ npm run dev
 - App: <http://localhost:3000> (landing) and <http://localhost:3000/app> (workspace)
 - Check the AI connection: <http://localhost:3000/api/health?deep=1> should show `"reachable": true`
 
-## Deploy to Vercel
+## Deploy to Vercel:
 
 1. Push this folder to a **new** GitHub repo. `.env.local` is git-ignored, so your key is never committed.
 2. vercel.com → **Add New → Project** → import the repo. Framework is detected as **Next.js**. Don't change build settings.
@@ -79,7 +79,7 @@ docs/API.md                 API reference
 - **Your key stays secret:** `OLLAMA_API_KEY` is only used server-side.
 - **No login or rate limiting:** anyone with the URL can use your Ollama quota. Fine for a demo; don't leave it public for long.
 
-## Troubleshooting
+## Troubleshooting:
 
 | What you see | Fix |
 |---|---|
