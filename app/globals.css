@@ -1,0 +1,117 @@
+/* Design tokens from the Lovable build, unchanged. Tailwind v4 scans the project automatically. */
+@import "tailwindcss";
+
+@theme inline {
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--ember);
+  --color-primary-foreground: var(--foreground);
+  --color-secondary: var(--raised);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--raised);
+  --color-muted-foreground: var(--fg-2);
+  --color-accent: var(--raised);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--ember);
+  --color-destructive-foreground: var(--foreground);
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--ember);
+  --color-ember: var(--ember);
+  --color-sage: var(--sage);
+  --color-sand: var(--sand);
+  --color-raised: var(--raised);
+  --color-surface: var(--card);
+  --color-line: var(--line);
+  --color-line-hover: var(--line-hover);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --font-display: "Barlow Condensed", sans-serif;
+  --font-sans: "Inter Tight", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --ease-praxis: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  --radius: 2px;
+  --background: oklch(0 0 0);
+  --card: oklch(0.145 0 0); /* #0A0A0A */
+  --raised: oklch(0.178 0 0); /* #111111 */
+  --line: oklch(0.235 0 0); /* #1F1F1F */
+  --line-hover: oklch(0.31 0 0); /* #2F2F2F */
+  --foreground: oklch(0.955 0.006 85); /* #F2F0EB */
+  --fg-2: oklch(0.63 0 0); /* #8B8B8B */
+  --fg-3: oklch(0.44 0 0); /* #555555 */
+  --ember: oklch(0.59 0.14 35); /* #C8553D */
+  --sage: oklch(0.65 0.05 150); /* #7E9C83 */
+  --sand: oklch(0.69 0.07 70); /* #B8956A */
+  --vignette: radial-gradient(ellipse at center, oklch(0.12 0 0) 0%, oklch(0 0 0) 70%);
+}
+
+@layer base {
+  * { border-color: var(--color-border); }
+  html { background: var(--background); }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible { outline: 1px solid var(--ember); outline-offset: 2px; }
+  ::selection { background: var(--ember); color: var(--foreground); }
+}
+
+@utility display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  line-height: 0.9;
+  letter-spacing: -0.01em;
+}
+@utility label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+@utility vignette { background: var(--vignette); }
+@utility shell { width: 100%; max-width: 1280px; margin-inline: auto; padding-inline: 16px; @media (min-width: 768px) { padding-inline: 24px; } }
+@utility underline-input {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  outline: none;
+  width: 100%;
+  &:focus { border-bottom-color: var(--ember); }
+  &::placeholder { color: var(--fg-3); }
+}
+@utility btn-primary {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--ember); color: var(--foreground);
+  border-radius: 2px; padding: 12px 20px; font-size: 14px; font-weight: 500;
+  transition: opacity 300ms;
+  &:hover { opacity: 0.88; }
+  &:disabled { opacity: 0.4; cursor: not-allowed; }
+}
+@utility btn-ghost {
+  display: inline-flex; align-items: center; gap: 8px;
+  border: 1px solid var(--line); color: var(--foreground);
+  border-radius: 2px; padding: 11px 18px; font-size: 14px; font-weight: 500;
+  transition: border-color 300ms;
+  &:hover { border-color: var(--line-hover); }
+  &:disabled { opacity: 0.4; cursor: not-allowed; }
+}
+
+@keyframes fill-line { from { transform: scaleX(0); } to { transform: scaleX(0.95); } }
+@utility loading-line { transform-origin: left; animation: fill-line 20s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
