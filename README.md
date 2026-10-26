@@ -1,4 +1,4 @@
-# PRAXISM.
+# PRAXISM
 
 **Turn ideas into action. One step at a time.**
 Tell Praxism your idea → it asks a few questions → gives you ONE next move → helps you do it → learns from your result → picks the next move.
