@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { motion, useMotionValueEvent, useReducedMotion, useScroll, useTransform, type MotionValue } from "framer-motion";
@@ -235,7 +236,10 @@ export function Landing() {
   return (
     <main className="bg-background">
       <header className="fixed inset-x-0 top-0 z-20 flex items-center justify-between px-4 py-6 md:px-6">
-        <span className="font-mono text-[12px] tracking-[0.4em]">PRAXISM</span>
+        <Link href="/" className="flex items-center gap-2.5 transition-opacity hover:opacity-80">
+          <Image src="/logo.png" alt="Praxism logo" width={20} height={28} className="h-5 w-auto" priority />
+          <span className="font-mono text-[12px] tracking-[0.4em]">PRAXISM</span>
+        </Link>
         <Link href="/app" className="text-[14px] text-fg-2 transition-colors hover:text-foreground">Start →</Link>
       </header>
       <Hero />

@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
@@ -67,7 +68,10 @@ export function Workspace() {
     <div className="min-h-screen bg-background">
       <header className="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-background px-4 py-4 md:px-6">
         <div className="flex items-center gap-4">
-          <Link href="/" className="font-mono text-[12px] tracking-[0.4em]">PRAXISM</Link>
+          <Link href="/" className="flex items-center gap-2.5 font-mono text-[12px] tracking-[0.4em] transition-opacity hover:opacity-80">
+            <Image src="/logo.png" alt="Praxism logo" width={20} height={28} className="h-5 w-auto" priority />
+            <span>PRAXISM</span>
+          </Link>
           {mock && <span className="label rounded-full border border-line px-2 py-0.5 text-fg-3">Mock data</span>}
         </div>
         <div className="flex items-center gap-2">
