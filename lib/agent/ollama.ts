@@ -29,20 +29,43 @@ export class OllamaError extends Error {
   }
 }
 
+function readEnvKey(...names: string[]): string {
+  for (const name of names) {
+    const raw = (process.env[name] || "").trim().replace(/^["']|["']$/g, "");
+    if (raw) return raw;
+  }
+  return "";
+}
+
+// Short-lived in-memory bypass when Ollama fails auth/billing (401/402/403) and Gemini backup is active.
+const OLLAMA_COOLDOWN_MS = 5 * 60_000;
+let ollamaCooldown: { key: string; until: number } | null = null;
+
 export function getConfig() {
   const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL || "https://ollama.com").replace(/\/+$/, "");
   const isLocalOllama = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(ollamaBaseUrl);
-  const ollamaApiKey = (process.env.OLLAMA_API_KEY || "").trim();
-  const geminiApiKey = (process.env.GEMINI_API_KEY || "").trim();
+  const ollamaApiKey = readEnvKey("OLLAMA_API_KEY");
+  const geminiApiKey = readEnvKey("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY");
 
   const ollamaModel = (process.env.OLLAMA_MODEL || "gpt-oss:120b").trim();
-  const geminiModel = (process.env.GEMINI_MODEL || "gemini-3.5-flash").trim().replace(/^models\//, "");
+  const geminiModel = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim().replace(/^models\//, "");
   const geminiBaseUrl = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
 
   const hasOllama = Boolean(ollamaApiKey) || isLocalOllama;
   const hasGemini = Boolean(geminiApiKey);
-  // Ollama is primary whenever configured; Gemini acts as automatic backup (or primary if Ollama is unconfigured).
-  const provider: AiProvider = hasOllama || !hasGemini ? "ollama" : "gemini";
+
+  const requestedPrimary = (process.env.PRIMARY_LLM_PROVIDER || "").trim().toLowerCase();
+  const ollamaInCooldown =
+    Boolean(ollamaCooldown) &&
+    ollamaCooldown!.key === ollamaApiKey &&
+    Date.now() < ollamaCooldown!.until;
+
+  // Use Gemini directly if explicitly requested via PRIMARY_LLM_PROVIDER=gemini, if Ollama isn't configured,
+  // or if Ollama recently failed auth/billing (401/402/403) in this process and Gemini is available.
+  const useGeminiPrimary =
+    hasGemini &&
+    (requestedPrimary === "gemini" || !hasOllama || (ollamaInCooldown && !isLocalOllama));
+  const provider: AiProvider = useGeminiPrimary ? "gemini" : "ollama";
 
   return {
     provider,
@@ -133,11 +156,20 @@ async function postProviderJson(
   }
 }
 
+const GEMINI_FALLBACK_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+];
+
 async function chatOnceGemini(
   cfg: ReturnType<typeof getConfig>,
   opts: ChatOptions,
   signal: AbortSignal,
+  modelOverride?: string,
 ): Promise<string> {
+  const model = modelOverride || cfg.gemini.model;
   const systemText = opts.messages
     .filter((m) => m.role === "system")
     .map((m) => m.content)
@@ -165,8 +197,8 @@ async function chatOnceGemini(
   const data = await postProviderJson(
     "Gemini",
     "GEMINI_API_KEY",
-    `Gemini could not find the model "${cfg.gemini.model}". Check GEMINI_MODEL.`,
-    `${cfg.gemini.baseUrl}/v1beta/models/${encodeURIComponent(cfg.gemini.model)}:generateContent`,
+    `Gemini could not find the model "${model}". Check GEMINI_MODEL.`,
+    `${cfg.gemini.baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     { "x-goog-api-key": cfg.gemini.apiKey },
     body,
     signal,
@@ -221,18 +253,21 @@ async function chatOnceWithProvider(
   provider: AiProvider,
   cfg: ReturnType<typeof getConfig>,
   opts: ChatOptions,
+  geminiModelOverride?: string,
+  perAttemptCapMs?: number,
 ): Promise<string> {
   const controller = new AbortController();
   const baseTimeout = Math.max(1000, Math.min(opts.timeoutMs ?? cfg.timeoutMs, cfg.timeoutMs));
+  const capped = perAttemptCapMs ? Math.min(baseTimeout, perAttemptCapMs) : baseTimeout;
   const timeout =
     provider === "ollama" && cfg.gemini.configured && !process.env.OLLAMA_TIMEOUT_MS
-      ? Math.min(baseTimeout, 25_000)
-      : baseTimeout;
+      ? Math.min(capped, 15_000)
+      : capped;
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
     return provider === "gemini"
-      ? await chatOnceGemini(cfg, opts, controller.signal)
+      ? await chatOnceGemini(cfg, opts, controller.signal, geminiModelOverride)
       : await chatOnceOllama(cfg, opts, controller.signal);
   } finally {
     clearTimeout(timer);
@@ -242,17 +277,44 @@ async function chatOnceWithProvider(
 async function chatWithProvider(provider: AiProvider, opts: ChatOptions): Promise<string> {
   const cfg = getConfig();
   const started = Date.now();
-  const attempt = async (o: ChatOptions) => {
+  const totalBudget = opts.timeoutMs ?? cfg.timeoutMs;
+
+  const attempt = async (o: ChatOptions, geminiModel?: string, capMs?: number) => {
     try {
-      return await chatOnceWithProvider(provider, cfg, o);
+      return await chatOnceWithProvider(provider, cfg, o, geminiModel, capMs);
     } catch (err) {
       // Some models reject `format` / `responseMimeType`. Retry once without it.
       if (err instanceof OllamaError && o.json && err.upstreamStatus === 400) {
-        return chatOnceWithProvider(provider, cfg, { ...o, json: false });
+        return chatOnceWithProvider(provider, cfg, { ...o, json: false }, geminiModel, capMs);
       }
       throw err;
     }
   };
+
+  if (provider === "gemini") {
+    const models = [
+      cfg.gemini.model,
+      ...GEMINI_FALLBACK_MODELS.filter((m) => m !== cfg.gemini.model),
+    ];
+    let lastErr: unknown;
+    for (let i = 0; i < models.length; i++) {
+      const remaining = totalBudget - (Date.now() - started);
+      if (remaining < 3000) break;
+      const hasMoreModels = i < models.length - 1;
+      const capMs = hasMoreModels ? Math.min(remaining, 18_000) : remaining;
+      try {
+        return await attempt({ ...opts, timeoutMs: remaining }, models[i], capMs);
+      } catch (err) {
+        lastErr = err;
+        // Don't retry other models if the API key itself was rejected.
+        if (err instanceof OllamaError && err.code === "auth") throw err;
+        console.warn(
+          `[praxism] Gemini model ${models[i]} failed (${err instanceof Error ? err.message : "unknown error"}); ${hasMoreModels ? `trying ${models[i + 1]}.` : "no more fallback models."}`,
+        );
+      }
+    }
+    throw lastErr;
+  }
 
   try {
     return await attempt(opts);
@@ -261,9 +323,9 @@ async function chatWithProvider(provider: AiProvider, opts: ChatOptions): Promis
       err instanceof OllamaError &&
       err.code === "upstream" &&
       (err.upstreamStatus === undefined || [500, 502, 503, 504].includes(err.upstreamStatus));
-    const budget = (opts.timeoutMs ?? cfg.timeoutMs) - (Date.now() - started);
+    const budget = totalBudget - (Date.now() - started);
     // When failing over from Ollama to Gemini, skip the Ollama retry and fail over immediately.
-    const canRetrySameProvider = provider === "gemini" || !cfg.gemini.configured;
+    const canRetrySameProvider = !cfg.gemini.configured;
     if (transient && canRetrySameProvider && budget > 4000) {
       await new Promise((r) => setTimeout(r, 700));
       return attempt({ ...opts, timeoutMs: budget - 700 });
@@ -284,20 +346,35 @@ async function chatWithMeta(
   }
 
   const primary = opts.forceProvider ?? cfg.provider;
+  const fallback: AiProvider | null =
+    primary === "ollama" && cfg.gemini.configured
+      ? "gemini"
+      : primary === "gemini" && cfg.ollama.configured
+        ? "ollama"
+        : null;
+
   const started = Date.now();
   try {
     const content = await chatWithProvider(primary, opts);
     return { content, provider: primary };
   } catch (err) {
-    if (primary === "ollama" && cfg.gemini.configured) {
+    if (fallback && !opts.forceProvider) {
+      if (
+        primary === "ollama" &&
+        !cfg.ollama.isLocal &&
+        err instanceof OllamaError &&
+        [401, 402, 403].includes(err.upstreamStatus ?? 0)
+      ) {
+        ollamaCooldown = { key: cfg.ollama.apiKey, until: Date.now() + OLLAMA_COOLDOWN_MS };
+      }
       const elapsed = Date.now() - started;
       const totalBudget = opts.timeoutMs ?? cfg.timeoutMs;
       const remaining = Math.max(15_000, totalBudget - elapsed);
       console.warn(
-        `[praxism] Ollama failed (${err instanceof Error ? err.message : "unknown error"}); falling back to Gemini (${cfg.gemini.model}).`,
+        `[praxism] ${primary} failed (${err instanceof Error ? err.message : "unknown error"}); falling back to ${fallback}.`,
       );
-      const content = await chatWithProvider("gemini", { ...opts, timeoutMs: remaining });
-      return { content, provider: "gemini" };
+      const content = await chatWithProvider(fallback, { ...opts, timeoutMs: remaining });
+      return { content, provider: fallback };
     }
     throw err;
   }
@@ -429,9 +506,11 @@ export async function generateJson<S extends z.ZodType>(
       },
     });
   } catch (err) {
-    if (!usedGemini && cfg.provider === "ollama" && cfg.gemini.configured && err instanceof OllamaError) {
+    if (!usedGemini && cfg.provider === "ollama" && cfg.gemini.configured) {
       const remainingBudget = Math.max(20_000, (opts.budgetMs ?? 52_000) - (Date.now() - started));
-      console.warn(`[praxism] Primary Ollama generation failed (${err.message}); retrying with backup Gemini.`);
+      console.warn(
+        `[praxism] Primary Ollama generation failed (${err instanceof Error ? err.message : "unknown error"}); retrying with backup Gemini.`,
+      );
       return await generateJsonWithProvider(schema, messages, {
         ...opts,
         budgetMs: remainingBudget,
