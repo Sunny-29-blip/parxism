@@ -14,7 +14,7 @@ export const OPTIONS = (req: Request) => preflight(req);
  */
 export const GET = handle(async (req) => {
   const cfg = getConfig();
-  const configured = Boolean(cfg.apiKey) || cfg.isLocal;
+  const configured = cfg.ollama.configured || cfg.gemini.configured;
 
   const body: Record<string, unknown> = {
     ok: configured,
@@ -23,18 +23,20 @@ export const GET = handle(async (req) => {
     config: {
       provider: cfg.provider,
       hasApiKey: Boolean(cfg.apiKey),
+      hasBackupGemini: cfg.gemini.configured,
       model: cfg.model,
+      backupModel: cfg.gemini.configured ? cfg.gemini.model : undefined,
       ollamaBaseUrl: cfg.baseUrl,
     },
   };
   if (!configured) {
-    body.problem = "Neither GEMINI_API_KEY nor OLLAMA_API_KEY is set on the server.";
+    body.problem = "Neither OLLAMA_API_KEY nor GEMINI_API_KEY is set on the server.";
   }
 
   if (new URL(req.url).searchParams.get("deep") === "1" && configured) {
     try {
       const r = await ping();
-      body.ollama = { reachable: true, latencyMs: r.ms };
+      body.ollama = { reachable: true, latencyMs: r.ms, provider: r.provider };
     } catch (err) {
       body.ok = false;
       body.ollama = {

@@ -32,26 +32,38 @@ export class OllamaError extends Error {
 export function getConfig() {
   const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL || "https://ollama.com").replace(/\/+$/, "");
   const isLocalOllama = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(ollamaBaseUrl);
-  const geminiApiKey = (process.env.GEMINI_API_KEY || "").trim();
   const ollamaApiKey = (process.env.OLLAMA_API_KEY || "").trim();
+  const geminiApiKey = (process.env.GEMINI_API_KEY || "").trim();
 
-  // Explicit OLLAMA_BASE_URL (e.g. local mock-ollama) keeps Ollama active; otherwise use Gemini when configured.
-  const useGemini = Boolean(geminiApiKey) && !process.env.OLLAMA_BASE_URL;
-  const provider: AiProvider = useGemini ? "gemini" : "ollama";
+  const ollamaModel = (process.env.OLLAMA_MODEL || "gpt-oss:120b").trim();
+  const geminiModel = (process.env.GEMINI_MODEL || "gemini-3.5-flash").trim().replace(/^models\//, "");
+  const geminiBaseUrl = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+
+  const hasOllama = Boolean(ollamaApiKey) || isLocalOllama;
+  const hasGemini = Boolean(geminiApiKey);
+  // Ollama is primary whenever configured; Gemini acts as automatic backup (or primary if Ollama is unconfigured).
+  const provider: AiProvider = hasOllama || !hasGemini ? "ollama" : "gemini";
 
   return {
     provider,
     apiKey: provider === "gemini" ? geminiApiKey : ollamaApiKey,
-    model:
-      provider === "gemini"
-        ? (process.env.GEMINI_MODEL || "gemini-3.5-flash").trim().replace(/^models\//, "")
-        : (process.env.OLLAMA_MODEL || "gpt-oss:120b").trim(),
-    baseUrl:
-      provider === "gemini"
-        ? (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/+$/, "")
-        : ollamaBaseUrl,
+    model: provider === "gemini" ? geminiModel : ollamaModel,
+    baseUrl: provider === "gemini" ? geminiBaseUrl : ollamaBaseUrl,
     isLocal: provider === "ollama" && isLocalOllama,
     timeoutMs: Number(process.env.AI_TIMEOUT_MS || process.env.OLLAMA_TIMEOUT_MS) || 40_000,
+    ollama: {
+      configured: hasOllama,
+      apiKey: ollamaApiKey,
+      model: ollamaModel,
+      baseUrl: ollamaBaseUrl,
+      isLocal: isLocalOllama,
+    },
+    gemini: {
+      configured: hasGemini,
+      apiKey: geminiApiKey,
+      model: geminiModel,
+      baseUrl: geminiBaseUrl,
+    },
   };
 }
 
@@ -153,9 +165,9 @@ async function chatOnceGemini(
   const data = await postProviderJson(
     "Gemini",
     "GEMINI_API_KEY",
-    `Gemini could not find the model "${cfg.model}". Check GEMINI_MODEL.`,
-    `${cfg.baseUrl}/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent`,
-    { "x-goog-api-key": cfg.apiKey },
+    `Gemini could not find the model "${cfg.gemini.model}". Check GEMINI_MODEL.`,
+    `${cfg.gemini.baseUrl}/v1beta/models/${encodeURIComponent(cfg.gemini.model)}:generateContent`,
+    { "x-goog-api-key": cfg.gemini.apiKey },
     body,
     signal,
   );
@@ -181,7 +193,7 @@ async function chatOnceOllama(
   signal: AbortSignal,
 ): Promise<string> {
   const body: Record<string, unknown> = {
-    model: cfg.model,
+    model: cfg.ollama.model,
     messages: opts.messages,
     stream: false,
     options: { temperature: opts.temperature ?? 0.4 },
@@ -191,9 +203,9 @@ async function chatOnceOllama(
   const data = await postProviderJson(
     "Ollama",
     "OLLAMA_API_KEY",
-    `Ollama could not find the model "${cfg.model}". Check OLLAMA_MODEL (hosted names have no ":cloud" suffix).`,
-    `${cfg.baseUrl}/api/chat`,
-    cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {},
+    `Ollama could not find the model "${cfg.ollama.model}". Check OLLAMA_MODEL (hosted names have no ":cloud" suffix).`,
+    `${cfg.ollama.baseUrl}/api/chat`,
+    cfg.ollama.apiKey ? { Authorization: `Bearer ${cfg.ollama.apiKey}` } : {},
     body,
     signal,
   );
@@ -205,22 +217,21 @@ async function chatOnceOllama(
   return content;
 }
 
-async function chatOnce(opts: ChatOptions): Promise<string> {
-  const cfg = getConfig();
-
-  if (!cfg.apiKey && !cfg.isLocal) {
-    throw new OllamaError(
-      "config",
-      "The server is missing GEMINI_API_KEY (or OLLAMA_API_KEY). Add it in your environment variables (Vercel: Project Settings → Environment Variables) and redeploy.",
-    );
-  }
-
+async function chatOnceWithProvider(
+  provider: AiProvider,
+  cfg: ReturnType<typeof getConfig>,
+  opts: ChatOptions,
+): Promise<string> {
   const controller = new AbortController();
-  const timeout = Math.max(1000, Math.min(opts.timeoutMs ?? cfg.timeoutMs, cfg.timeoutMs));
+  const baseTimeout = Math.max(1000, Math.min(opts.timeoutMs ?? cfg.timeoutMs, cfg.timeoutMs));
+  const timeout =
+    provider === "ollama" && cfg.gemini.configured && !process.env.OLLAMA_TIMEOUT_MS
+      ? Math.min(baseTimeout, 25_000)
+      : baseTimeout;
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    return cfg.provider === "gemini"
+    return provider === "gemini"
       ? await chatOnceGemini(cfg, opts, controller.signal)
       : await chatOnceOllama(cfg, opts, controller.signal);
   } finally {
@@ -228,16 +239,16 @@ async function chatOnce(opts: ChatOptions): Promise<string> {
   }
 }
 
-/** One chat call with a single retry for transient failures. */
-export async function chat(opts: ChatOptions): Promise<string> {
+async function chatWithProvider(provider: AiProvider, opts: ChatOptions): Promise<string> {
+  const cfg = getConfig();
   const started = Date.now();
   const attempt = async (o: ChatOptions) => {
     try {
-      return await chatOnce(o);
+      return await chatOnceWithProvider(provider, cfg, o);
     } catch (err) {
-      // Some models reject `format`. Retry once without it.
+      // Some models reject `format` / `responseMimeType`. Retry once without it.
       if (err instanceof OllamaError && o.json && err.upstreamStatus === 400) {
-        return chatOnce({ ...o, json: false });
+        return chatOnceWithProvider(provider, cfg, { ...o, json: false });
       }
       throw err;
     }
@@ -250,13 +261,52 @@ export async function chat(opts: ChatOptions): Promise<string> {
       err instanceof OllamaError &&
       err.code === "upstream" &&
       (err.upstreamStatus === undefined || [500, 502, 503, 504].includes(err.upstreamStatus));
-    const budget = (opts.timeoutMs ?? getConfig().timeoutMs) - (Date.now() - started);
-    if (transient && budget > 4000) {
+    const budget = (opts.timeoutMs ?? cfg.timeoutMs) - (Date.now() - started);
+    // When failing over from Ollama to Gemini, skip the Ollama retry and fail over immediately.
+    const canRetrySameProvider = provider === "gemini" || !cfg.gemini.configured;
+    if (transient && canRetrySameProvider && budget > 4000) {
       await new Promise((r) => setTimeout(r, 700));
       return attempt({ ...opts, timeoutMs: budget - 700 });
     }
     throw err;
   }
+}
+
+async function chatWithMeta(
+  opts: ChatOptions & { forceProvider?: AiProvider },
+): Promise<{ content: string; provider: AiProvider }> {
+  const cfg = getConfig();
+  if (!cfg.ollama.configured && !cfg.gemini.configured) {
+    throw new OllamaError(
+      "config",
+      "The server is missing OLLAMA_API_KEY (or backup GEMINI_API_KEY). Add one in your environment variables (Vercel: Project Settings → Environment Variables) and redeploy.",
+    );
+  }
+
+  const primary = opts.forceProvider ?? cfg.provider;
+  const started = Date.now();
+  try {
+    const content = await chatWithProvider(primary, opts);
+    return { content, provider: primary };
+  } catch (err) {
+    if (primary === "ollama" && cfg.gemini.configured) {
+      const elapsed = Date.now() - started;
+      const totalBudget = opts.timeoutMs ?? cfg.timeoutMs;
+      const remaining = Math.max(15_000, totalBudget - elapsed);
+      console.warn(
+        `[praxism] Ollama failed (${err instanceof Error ? err.message : "unknown error"}); falling back to Gemini (${cfg.gemini.model}).`,
+      );
+      const content = await chatWithProvider("gemini", { ...opts, timeoutMs: remaining });
+      return { content, provider: "gemini" };
+    }
+    throw err;
+  }
+}
+
+/** One chat call with automatic fallback from Ollama to Gemini if configured. */
+export async function chat(opts: ChatOptions): Promise<string> {
+  const res = await chatWithMeta(opts);
+  return res.content;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -297,15 +347,22 @@ function describeIssues(error: z.ZodError): string {
  * If the output is malformed, the model is shown what was wrong and asked to
  * fix it (up to `maxAttempts` total tries, within an overall time budget).
  */
-export async function generateJson<S extends z.ZodType>(
+async function generateJsonWithProvider<S extends z.ZodType>(
   schema: S,
   messages: ChatMessage[],
-  opts: { temperature?: number; maxAttempts?: number; budgetMs?: number } = {},
+  opts: {
+    temperature?: number;
+    maxAttempts?: number;
+    budgetMs?: number;
+    forceProvider?: AiProvider;
+    onProvider?: (provider: AiProvider) => void;
+  } = {},
 ): Promise<z.output<S>> {
   const maxAttempts = opts.maxAttempts ?? 3;
   const budgetMs = opts.budgetMs ?? 52_000;
   const started = Date.now();
   let convo = messages;
+  let activeProvider = opts.forceProvider;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remaining = budgetMs - (Date.now() - started);
@@ -313,15 +370,19 @@ export async function generateJson<S extends z.ZodType>(
       throw new OllamaError("timeout", "The AI model took too long to respond. Please try again.");
     }
 
-    const raw = await chat({
+    const res = await chatWithMeta({
       messages: convo,
       temperature: opts.temperature,
       json: true,
       timeoutMs: remaining,
+      forceProvider: activeProvider,
     });
+    // Stay on whichever provider succeeded for any schema-repair retries in this turn.
+    activeProvider = res.provider;
+    opts.onProvider?.(res.provider);
 
     let problem: string;
-    const extracted = extractJson(raw);
+    const extracted = extractJson(res.content);
     if (extracted.ok) {
       const parsed = schema.safeParse(extracted.value);
       if (parsed.success) return parsed.data;
@@ -333,7 +394,7 @@ export async function generateJson<S extends z.ZodType>(
     console.warn(`[praxism] model output rejected (attempt ${attempt}/${maxAttempts}): ${problem}`);
     convo = [
       ...messages,
-      { role: "assistant", content: raw.slice(0, 6000) },
+      { role: "assistant", content: res.content.slice(0, 6000) },
       {
         role: "user",
         content: `Your previous reply was rejected: ${problem}\nReply again with ONLY the corrected JSON object, exactly in the requested shape. No prose, no markdown.`,
@@ -347,13 +408,47 @@ export async function generateJson<S extends z.ZodType>(
   );
 }
 
-/** Tiny round-trip used by GET /api/health?deep=1 */
-export async function ping(): Promise<{ ok: true; ms: number }> {
+/**
+ * Ask the model for JSON and validate it against a zod schema.
+ * If Ollama fails (or returns unusable output) and Gemini is configured, falls back to Gemini.
+ */
+export async function generateJson<S extends z.ZodType>(
+  schema: S,
+  messages: ChatMessage[],
+  opts: { temperature?: number; maxAttempts?: number; budgetMs?: number } = {},
+): Promise<z.output<S>> {
+  const cfg = getConfig();
   const started = Date.now();
-  await chat({
+  let usedGemini = cfg.provider === "gemini";
+
+  try {
+    return await generateJsonWithProvider(schema, messages, {
+      ...opts,
+      onProvider: (p) => {
+        if (p === "gemini") usedGemini = true;
+      },
+    });
+  } catch (err) {
+    if (!usedGemini && cfg.provider === "ollama" && cfg.gemini.configured && err instanceof OllamaError) {
+      const remainingBudget = Math.max(20_000, (opts.budgetMs ?? 52_000) - (Date.now() - started));
+      console.warn(`[praxism] Primary Ollama generation failed (${err.message}); retrying with backup Gemini.`);
+      return await generateJsonWithProvider(schema, messages, {
+        ...opts,
+        budgetMs: remainingBudget,
+        forceProvider: "gemini",
+      });
+    }
+    throw err;
+  }
+}
+
+/** Tiny round-trip used by GET /api/health?deep=1 */
+export async function ping(): Promise<{ ok: true; ms: number; provider: AiProvider }> {
+  const started = Date.now();
+  const res = await chatWithMeta({
     messages: [{ role: "user", content: "Reply with the single word: pong" }],
     temperature: 0,
     timeoutMs: 25_000,
   });
-  return { ok: true, ms: Date.now() - started };
+  return { ok: true, ms: Date.now() - started, provider: res.provider };
 }
