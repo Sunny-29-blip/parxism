@@ -21,13 +21,14 @@ export const GET = handle(async (req) => {
     service: "praxism-backend",
     time: new Date().toISOString(),
     config: {
+      provider: cfg.provider,
       hasApiKey: Boolean(cfg.apiKey),
       model: cfg.model,
       ollamaBaseUrl: cfg.baseUrl,
     },
   };
   if (!configured) {
-    body.problem = "OLLAMA_API_KEY is not set on the server.";
+    body.problem = "Neither GEMINI_API_KEY nor OLLAMA_API_KEY is set on the server.";
   }
 
   if (new URL(req.url).searchParams.get("deep") === "1" && configured) {
