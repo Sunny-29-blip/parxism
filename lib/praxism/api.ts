@@ -42,13 +42,24 @@ async function post(path: string, body: unknown): Promise<SuccessResponse> {
   } catch {
     throw new PraxismError("network", "Could not reach Praxism. Check your connection and retry.");
   }
-  const json = (await res.json().catch(() => null)) as SuccessResponse | ErrorResponse | null;
+  const rawText = await res.text().catch(() => "");
+  let json: SuccessResponse | ErrorResponse | null = null;
+  if (rawText) {
+    try {
+      json = JSON.parse(rawText) as SuccessResponse | ErrorResponse;
+    } catch {
+      json = null;
+    }
+  }
   if (!res.ok || !json || !json.ok) {
     const err = json && !json.ok ? json.error : null;
     if (!err && res.status === 504) {
-      throw new PraxismError("timeout", "The AI took too long to answer. Retry, it usually works the second time.");
+      throw new PraxismError("timeout", "The AI took too long to answer (HTTP 504). Retry, it usually works the second time.");
     }
-    throw new PraxismError(err?.code ?? "unknown", err?.message ?? `Request failed (${res.status}).`);
+    const fallbackMsg = rawText.trim()
+      ? `HTTP ${res.status}: ${rawText.trim().slice(0, 220)}`
+      : `Request failed (HTTP ${res.status}).`;
+    throw new PraxismError(err?.code ?? "unknown", err?.message ?? fallbackMsg);
   }
   return json;
 }

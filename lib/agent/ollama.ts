@@ -45,7 +45,12 @@ export function getConfig() {
   const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL || "https://ollama.com").replace(/\/+$/, "");
   const isLocalOllama = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(ollamaBaseUrl);
   const ollamaApiKey = readEnvKey("OLLAMA_API_KEY");
-  const geminiApiKey = readEnvKey("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY");
+  const geminiApiKey = readEnvKey(
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "NEXT_PUBLIC_GEMINI_API_KEY",
+  );
 
   const ollamaModel = (process.env.OLLAMA_MODEL || "gpt-oss:120b").trim();
   const geminiModel = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite").trim().replace(/^models\//, "");
@@ -54,18 +59,17 @@ export function getConfig() {
   const hasOllama = Boolean(ollamaApiKey) || isLocalOllama;
   const hasGemini = Boolean(geminiApiKey);
 
+  // Gemini is the direct primary provider by default. Set PRIMARY_LLM_PROVIDER=ollama (or use local OLLAMA_BASE_URL) to re-enable Ollama.
   const requestedPrimary = (process.env.PRIMARY_LLM_PROVIDER || "").trim().toLowerCase();
   const ollamaInCooldown =
     Boolean(ollamaCooldown) &&
     ollamaCooldown!.key === ollamaApiKey &&
     Date.now() < ollamaCooldown!.until;
 
-  // Use Gemini directly if explicitly requested via PRIMARY_LLM_PROVIDER=gemini, if Ollama isn't configured,
-  // or if Ollama recently failed auth/billing (401/402/403) in this process and Gemini is available.
-  const useGeminiPrimary =
-    hasGemini &&
-    (requestedPrimary === "gemini" || !hasOllama || (ollamaInCooldown && !isLocalOllama));
-  const provider: AiProvider = useGeminiPrimary ? "gemini" : "ollama";
+  const useOllamaPrimary =
+    !ollamaInCooldown &&
+    (requestedPrimary === "ollama" || (isLocalOllama && requestedPrimary !== "gemini"));
+  const provider: AiProvider = useOllamaPrimary ? "ollama" : "gemini";
 
   return {
     provider,
@@ -98,11 +102,28 @@ type ChatOptions = {
   timeoutMs?: number;
 };
 
+function extractErrorDetail(rawText: string): string {
+  const trimmed = rawText.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: { message?: unknown } | unknown };
+    if (parsed && typeof parsed === "object" && parsed.error) {
+      if (typeof parsed.error === "string") return parsed.error.slice(0, 300);
+      if (typeof (parsed.error as { message?: unknown }).message === "string") {
+        return ((parsed.error as { message: string }).message).slice(0, 300);
+      }
+    }
+  } catch {
+    /* non-JSON body */
+  }
+  return trimmed.slice(0, 300);
+}
+
 /** Send a JSON POST request to the configured provider and map HTTP/network errors uniformly. */
 async function postProviderJson(
   providerLabel: string,
   envKeyName: string,
-  modelHint: string,
+  _modelHint: string,
   url: string,
   headers: Record<string, string>,
   body: Record<string, unknown>,
@@ -117,50 +138,60 @@ async function postProviderJson(
       signal,
       cache: "no-store",
     });
-  } catch {
+  } catch (err) {
     if (signal.aborted) {
-      throw new OllamaError("timeout", "The AI model took too long to respond. Please try again.");
+      throw new OllamaError("timeout", `${providerLabel} request timed out. Please try again.`);
     }
-    throw new OllamaError("upstream", `Could not reach the ${providerLabel} API. Please try again.`);
+    const reason = err instanceof Error && err.message ? err.message : "Network request failed";
+    throw new OllamaError("upstream", `Could not reach ${providerLabel} API (${reason}).`);
   }
 
+  const rawText = await res.text().catch(() => "");
   if (!res.ok) {
-    const detail = (await res.text().catch(() => "")).slice(0, 300);
-    if (res.status === 401 || res.status === 403 || detail.includes("API_KEY_INVALID")) {
+    const detail = extractErrorDetail(rawText);
+    const suffix = detail ? `: ${detail}` : "";
+    if (
+      res.status === 401 ||
+      res.status === 403 ||
+      rawText.includes("API_KEY_INVALID") ||
+      detail.toLowerCase().includes("api key not valid")
+    ) {
       throw new OllamaError(
         "auth",
-        `${providerLabel} rejected the API key. Check that ${envKeyName} is correct and active.`,
+        `${providerLabel} HTTP ${res.status} (check ${envKeyName})${suffix}`,
         res.status,
       );
     }
     if (res.status === 429) {
       throw new OllamaError(
         "rate_limit",
-        `${providerLabel} rate limit reached. Wait a moment and try again.`,
+        `${providerLabel} HTTP 429 (rate limit)${suffix}`,
         429,
       );
     }
     if (res.status === 404) {
-      throw new OllamaError("config", modelHint, 404);
+      throw new OllamaError("config", `${providerLabel} HTTP 404${suffix}`, 404);
     }
-    throw new OllamaError("upstream", `${providerLabel} returned HTTP ${res.status}. ${detail}`.trim(), res.status);
+    throw new OllamaError("upstream", `${providerLabel} HTTP ${res.status}${suffix}`, res.status);
   }
 
   try {
-    return await res.json();
+    return JSON.parse(rawText);
   } catch {
     if (signal.aborted) {
-      throw new OllamaError("timeout", "The AI model took too long to respond. Please try again.");
+      throw new OllamaError("timeout", `${providerLabel} request timed out. Please try again.`);
     }
-    throw new OllamaError("bad_response", `${providerLabel} returned a response that was not valid JSON.`);
+    throw new OllamaError(
+      "bad_response",
+      `${providerLabel} returned invalid JSON (HTTP ${res.status}): ${rawText.slice(0, 200)}`,
+    );
   }
 }
 
 const GEMINI_FALLBACK_MODELS = [
   "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
+  "gemini-3-flash-preview",
   "gemini-3.6-flash",
-  "gemini-3.5-flash",
 ];
 
 async function chatOnceGemini(
@@ -204,8 +235,14 @@ async function chatOnceGemini(
     signal,
   );
 
-  const parts = (data as { candidates?: Array<{ content?: { parts?: Array<{ text?: unknown; thought?: boolean }> } }> })
-    ?.candidates?.[0]?.content?.parts;
+  const typed = data as {
+    candidates?: Array<{
+      finishReason?: string;
+      content?: { parts?: Array<{ text?: unknown; thought?: boolean }> };
+    }>;
+    promptFeedback?: { blockReason?: string };
+  };
+  const parts = typed?.candidates?.[0]?.content?.parts;
   const content = Array.isArray(parts)
     ? parts
         .filter((p) => !p.thought && typeof p.text === "string")
@@ -214,7 +251,9 @@ async function chatOnceGemini(
     : "";
 
   if (!content.trim()) {
-    throw new OllamaError("bad_response", "The model returned an empty response.");
+    const reason =
+      typed?.promptFeedback?.blockReason || typed?.candidates?.[0]?.finishReason || "empty content";
+    throw new OllamaError("bad_response", `Gemini (${model}) returned an empty response (${reason}).`);
   }
   return content;
 }
@@ -283,8 +322,8 @@ async function chatWithProvider(provider: AiProvider, opts: ChatOptions): Promis
     try {
       return await chatOnceWithProvider(provider, cfg, o, geminiModel, capMs);
     } catch (err) {
-      // Some models reject `format` / `responseMimeType`. Retry once without it.
-      if (err instanceof OllamaError && o.json && err.upstreamStatus === 400) {
+      // Some models reject `format` / `responseMimeType`. Retry once without it (unless auth failed).
+      if (err instanceof OllamaError && err.code !== "auth" && o.json && err.upstreamStatus === 400) {
         return chatOnceWithProvider(provider, cfg, { ...o, json: false }, geminiModel, capMs);
       }
       throw err;
@@ -301,7 +340,7 @@ async function chatWithProvider(provider: AiProvider, opts: ChatOptions): Promis
       const remaining = totalBudget - (Date.now() - started);
       if (remaining < 3000) break;
       const hasMoreModels = i < models.length - 1;
-      const capMs = hasMoreModels ? Math.min(remaining, 18_000) : remaining;
+      const capMs = hasMoreModels ? Math.min(remaining, 12_000) : remaining;
       try {
         return await attempt({ ...opts, timeoutMs: remaining }, models[i], capMs);
       } catch (err) {
@@ -338,20 +377,28 @@ async function chatWithMeta(
   opts: ChatOptions & { forceProvider?: AiProvider },
 ): Promise<{ content: string; provider: AiProvider }> {
   const cfg = getConfig();
-  if (!cfg.ollama.configured && !cfg.gemini.configured) {
+  const primary = opts.forceProvider ?? cfg.provider;
+
+  if (primary === "gemini" && !cfg.gemini.configured) {
     throw new OllamaError(
       "config",
-      "The server is missing OLLAMA_API_KEY (or backup GEMINI_API_KEY). Add one in your environment variables (Vercel: Project Settings → Environment Variables) and redeploy.",
+      "The server is missing GEMINI_API_KEY. Add GEMINI_API_KEY in your environment variables (Vercel: Project Settings → Environment Variables) and redeploy.",
+    );
+  }
+  if (primary === "ollama" && !cfg.ollama.configured) {
+    if (cfg.gemini.configured) {
+      const content = await chatWithProvider("gemini", opts);
+      return { content, provider: "gemini" };
+    }
+    throw new OllamaError(
+      "config",
+      "The server is missing OLLAMA_API_KEY and GEMINI_API_KEY. Add GEMINI_API_KEY in your environment variables and redeploy.",
     );
   }
 
-  const primary = opts.forceProvider ?? cfg.provider;
+  // Only fall back from Ollama -> Gemini when Ollama was explicitly selected as primary; never fall back from Gemini -> Ollama.
   const fallback: AiProvider | null =
-    primary === "ollama" && cfg.gemini.configured
-      ? "gemini"
-      : primary === "gemini" && cfg.ollama.configured
-        ? "ollama"
-        : null;
+    primary === "ollama" && cfg.gemini.configured ? "gemini" : null;
 
   const started = Date.now();
   try {

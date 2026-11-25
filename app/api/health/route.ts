@@ -14,7 +14,7 @@ export const OPTIONS = (req: Request) => preflight(req);
  */
 export const GET = handle(async (req) => {
   const cfg = getConfig();
-  const configured = cfg.ollama.configured || cfg.gemini.configured;
+  const configured = cfg.provider === "gemini" ? cfg.gemini.configured : cfg.ollama.configured || cfg.gemini.configured;
 
   const body: Record<string, unknown> = {
     ok: configured,
@@ -30,7 +30,10 @@ export const GET = handle(async (req) => {
     },
   };
   if (!configured) {
-    body.problem = "Neither OLLAMA_API_KEY nor GEMINI_API_KEY is set on the server.";
+    body.problem =
+      cfg.provider === "gemini"
+        ? "GEMINI_API_KEY is not set on the server."
+        : "Neither OLLAMA_API_KEY nor GEMINI_API_KEY is set on the server.";
   }
 
   if (new URL(req.url).searchParams.get("deep") === "1" && configured) {
